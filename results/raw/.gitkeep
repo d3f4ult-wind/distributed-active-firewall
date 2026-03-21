@@ -1,0 +1,3 @@
+# Thư mục này chứa số liệu thô (.csv, .log) từ các lần đo benchmark.
+# Các file .csv và .log bị .gitignore lọc — chỉ commit .gitkeep này.
+# Nguyên tắc: KHÔNG chỉnh sửa số liệu thô, chỉ đọc để vẽ biểu đồ.

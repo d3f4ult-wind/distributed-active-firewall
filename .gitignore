@@ -1,0 +1,16 @@
+# Build artifacts (eBPF)
+*.o
+build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs & raw data (không commit số liệu thô nặng lên GitHub)
+*.log
+results/raw/*.csv
+results/raw/*.log
+
+# Environment secrets (file .env thật chứa IP, credentials — KHÔNG BAO GIỜ commit)
+.env

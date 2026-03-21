@@ -1,0 +1,4 @@
+# Thư viện Python cần thiết cho Honeypot.
+# Cài đặt bằng lệnh: pip install -r requirements.txt
+# redis-py  : publish IP kẻ tấn công lên kênh Redis
+# paramiko  : giả lập SSH server để dụ brute-force

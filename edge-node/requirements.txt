@@ -1,0 +1,4 @@
+# Thư viện Python cần thiết cho Edge Node (userspace).
+# Cài đặt bằng lệnh: pip install -r requirements.txt
+# redis-py     : kết nối và subscribe kênh Redis Pub/Sub
+# pyroute2     : tương tác với kernel để load/unload XDP program

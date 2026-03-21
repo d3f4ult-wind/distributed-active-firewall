@@ -1,0 +1,46 @@
+distributed-active-firewall/
+├── README.md                        # tổng quan dự án, hướng dẫn setup nhanh
+├── LICENSE                          # MIT License
+├── .gitignore                       # *.o, build/, __pycache__, *.log, .env, *.pyc
+├── .env.example                     # mẫu biến môi trường (REDIS_HOST, REDIS_PORT...)
+│
+├── docs/
+│   ├── proposal.md                  # đề cương gốc
+│   ├── architecture.md              # sơ đồ hệ thống, luồng hoạt động
+│   ├── channel_schema.md            # định dạng message trao đổi qua Redis
+│   ├── weekly-log.md                # nhật ký tiến độ từng tuần
+│   └── references.md                # papers, links tham khảo
+│
+├── env/
+│   ├── Vagrantfile                  # hoặc docker-compose.yml — tái tạo 3 VM Ubuntu
+│   ├── setup.sh                     # script cài đặt tự động (libbpf, redis, python deps)
+│   ├── network-topology.md          # IP, subnet, vai trò của từng VM
+│   └── redis.conf                   # cấu hình Redis Pub/Sub (hạ tầng)
+│
+├── edge-node/
+│   ├── requirements.txt             # bpftool bindings, redis-py, etc.
+│   ├── kernel/                      # code chạy trong Kernel space (C + eBPF)
+│   │   ├── xdp_filter.c             # logic drop packet, tra cứu LRU Hash Map
+│   │   └── Makefile                 # compile với clang + libbpf → xuất ra build/
+│   ├── build/                       # (git-ignored) chứa xdp_filter.o sau khi make
+│   │   └── .gitkeep
+│   └── userspace/                   # code chạy trong User space (Python)
+│       ├── map_manager.py           # đọc/ghi eBPF LRU Map từ userspace
+│       └── node_agent.py            # subscribe Redis, nhận IP xấu → cập nhật Map
+│
+├── honeypot/
+│   ├── requirements.txt             # redis-py, paramiko (SSH giả), etc.
+│   ├── honeypot.py                  # điều phối chính: lắng nghe, ghi nhận, báo cáo
+│   ├── fake_services.py             # SSH/Telnet giả mạo mở trên unused IPs
+│   └── reporter.py                  # publish IP kẻ tấn công lên Redis channel
+│
+├── tests/
+│   ├── attack_sim.sh                # nmap scan, brute-force SSH mô phỏng
+│   ├── pktgen_flood.sh              # benchmark XDP vs iptables dưới tải cao
+│   └── sync_latency_test.py         # đo độ trễ đồng bộ từ Honeypot đến các node (ms)
+│
+└── results/
+    ├── raw/                         # số liệu thô (.csv, .log) — không chỉnh sửa
+    │   └── .gitkeep
+    └── charts/                      # biểu đồ đã xử lý (PNG/SVG) — dùng trong báo cáo
+        └── .gitkeep

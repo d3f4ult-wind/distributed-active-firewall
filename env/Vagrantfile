@@ -1,0 +1,4 @@
+# Vagrantfile — Cấu hình tái tạo môi trường lab 3 máy ảo Ubuntu
+# Chạy 'vagrant up' để tự động dựng toàn bộ hệ thống phân tán.
+# Mỗi VM đóng vai trò: 1x Honeypot, 1x Edge Node, 1x Redis Broker + Attacker.
+# Provisioning script tự động clone repo và cài đặt dependencies.
