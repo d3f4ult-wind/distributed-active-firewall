@@ -1,4 +1,15 @@
 # Thư viện Python cần thiết cho Honeypot.
 # Cài đặt bằng lệnh: pip install -r requirements.txt
 # redis-py  : publish IP kẻ tấn công lên kênh Redis
-# paramiko  : giả lập SSH server để dụ brute-force
+
+# honeypot/requirements.txt
+# Python >= 3.11 required (dùng asyncio.TaskGroup, match statement)
+
+# Redis async client — thư viện chính thức, hỗ trợ Pub/Sub async
+redis[hiredis]>=5.0.0
+
+# Tùy chọn: nếu muốn fake SSH thật hơn (bắt full handshake)
+# paramiko>=3.4.0
+
+# Tùy chọn: structured logging dạng JSON (dùng khi tích hợp với ELK/Grafana)
+# python-json-logger>=2.0.7
