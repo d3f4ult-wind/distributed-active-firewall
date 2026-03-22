@@ -28,7 +28,7 @@ Thiết kế quan trọng — Abstract Layer:
     │  EbpfMapInterface  (abstract)                                   │
     │         │                                                       │
     │    ┌────┴────────────────────────┐                              │
-    │    │                             │                              │
+    │    │                            │                               │
     │  MockEbpfMap               RealEbpfMap  ← implement SAU khi     │
     │  (dùng ngay bây giờ,         (Tháng 1)   xdp_filter.c xong      │
     │   chỉ log ra stdout)                                            │
@@ -54,6 +54,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -523,6 +524,19 @@ class NodeAgent:
                 f"🔒 [{self.node_id}] ĐÃ CHẶN IP: {ip} | "
                 f"Tổng đang chặn: {self.stats.ips_blocked}"
             )
+            # ── Latency Probe: gửi ack ngay sau khi Map được cập nhật ──
+            # Chỉ chạy khi message có field "latency_probe": true
+            # (được gửi bởi sync_latency_test.py, không phải Honeypot thật)
+            # T2 được tính tại đây — ngay sau block_ip() thành công —
+            # rồi publish lên channel riêng để script đo nhận được.
+            if message.get("latency_probe") and self._redis:
+                ack = json.dumps({
+                    "probe_id": message.get("probe_id", ""),
+                    "ip": ip,
+                    "node_id": self.node_id,
+                    "t_ack_ns": time.monotonic_ns(),
+                })
+                await self._redis.publish("firewall:latency:ack", ack)
         else:
             self.stats.errors += 1
             logger.error(f"❌ [{self.node_id}] Không thể chặn IP {ip}: {result.message}")
