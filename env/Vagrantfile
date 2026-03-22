@@ -2,3 +2,123 @@
 # Chạy 'vagrant up' để tự động dựng toàn bộ hệ thống phân tán.
 # Mỗi VM đóng vai trò: 1x Honeypot, 1x Edge Node, 1x Redis Broker + Attacker.
 # Provisioning script tự động clone repo và cài đặt dependencies.
+# -----------------------------------------------------------------------------
+# =============================================================================
+# Vagrantfile — Tái tạo môi trường lab 3 VM cho đồ án
+#
+# Topology:
+#
+#   ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+#   │   VM1           │     │   VM2           │     │   VM3           │
+#   │   edge-node-1   │     │   edge-node-2   │     │   attacker      │
+#   │   192.168.56.10 │     │   192.168.56.11 │     │   192.168.56.20 │
+#   │                 │     │                 │     │                 │
+#   │ - XDP/eBPF      │     │ - XDP/eBPF      │     │ - nmap          │
+#   │ - node_agent.py │     │ - node_agent.py │     │ - hydra         │
+#   │ - honeypot.py   │     │                 │     │ - attack_sim.sh │
+#   │ - Redis server  │     │                 │     │                 │
+#   └────────┬────────┘     └────────┬────────┘     └────────┬────────┘
+#            │                       │                       │
+#            └───────────────────────┴───────────────────────┘
+#                         Host-only Network: 192.168.56.0/24
+#
+# Cách dùng:
+#   vagrant up               # khởi động cả 3 VM (lần đầu ~10-15 phút)
+#   vagrant up edge1         # chỉ bật VM1
+#   vagrant ssh edge1        # SSH vào VM1
+#   vagrant halt             # tắt tất cả
+#   vagrant destroy -f       # xóa tất cả, làm lại từ đầu
+#
+# Yêu cầu:
+#   - VirtualBox >= 6.1
+#   - Vagrant >= 2.3
+#   - vagrant plugin install vagrant-vbguest (tùy chọn, tắt auto-update)
+# =============================================================================
+
+Vagrant.configure("2") do |config|
+
+  # Base box: Ubuntu 22.04 LTS — khớp với yêu cầu libbpf-dev và kernel 5.15+
+  # Kernel 5.15+ cần thiết vì BPF_MAP_TYPE_LRU_HASH ổn định từ kernel 4.10,
+  # nhưng một số libbpf API mới hơn cần 5.x
+  config.vm.box = "ubuntu/jammy64"
+  config.vm.box_check_update = false
+
+  # Tắt auto-update VirtualBox Guest Additions (tránh lỗi khi build)
+  if Vagrant.has_plugin?("vagrant-vbguest")
+    config.vbguest.auto_update = false
+  end
+
+  # Thư mục project được mount vào tất cả VM
+  # → Thay đổi code trên host, tất cả VM thấy ngay, không cần copy
+  config.vm.synced_folder ".", "/home/vagrant/project",
+    owner: "vagrant", group: "vagrant"
+
+  # ── VM1: Edge Node 1 + Redis + Honeypot ─────────────────────────────────────
+  config.vm.define "edge1", primary: true do |edge1|
+    edge1.vm.hostname = "edge-node-1"
+    edge1.vm.network "private_network", ip: "192.168.56.10"
+
+    edge1.vm.provider "virtualbox" do |vb|
+      vb.name   = "firewall-edge1"
+      vb.memory = 1024   # 1GB đủ cho Python + Redis
+      vb.cpus   = 2      # 2 core để benchmark XDP vs iptables có ý nghĩa
+      # Tắt audio/USB để boot nhanh hơn
+      vb.customize ["modifyvm", :id, "--audio", "none"]
+      vb.customize ["modifyvm", :id, "--usb", "off"]
+      # Bật nested VT-x/AMD-V — không cần cho XDP nhưng tốt để có
+      vb.customize ["modifyvm", :id, "--nested-hw-virt", "on"]
+    end
+
+    edge1.vm.provision "shell",
+      path: "env/setup.sh",
+      env: {
+        "NODE_ROLE"  => "edge_and_honeypot",
+        "NODE_ID"    => "edge-node-1",
+        "REDIS_HOST" => "127.0.0.1",   # Redis chạy local trên VM1
+        "NODE_IP"    => "192.168.56.10"
+      }
+  end
+
+  # ── VM2: Edge Node 2 (subscribe Redis trên VM1) ──────────────────────────────
+  config.vm.define "edge2" do |edge2|
+    edge2.vm.hostname = "edge-node-2"
+    edge2.vm.network "private_network", ip: "192.168.56.11"
+
+    edge2.vm.provider "virtualbox" do |vb|
+      vb.name   = "firewall-edge2"
+      vb.memory = 512
+      vb.cpus   = 2
+      vb.customize ["modifyvm", :id, "--audio", "none"]
+      vb.customize ["modifyvm", :id, "--usb", "off"]
+      vb.customize ["modifyvm", :id, "--nested-hw-virt", "on"]
+    end
+
+    edge2.vm.provision "shell",
+      path: "env/setup.sh",
+      env: {
+        "NODE_ROLE"  => "edge_only",
+        "NODE_ID"    => "edge-node-2",
+        "REDIS_HOST" => "192.168.56.10",   # Kết nối Redis trên VM1
+        "NODE_IP"    => "192.168.56.11"
+      }
+  end
+
+  # ── VM3: Attacker ────────────────────────────────────────────────────────────
+  config.vm.define "attacker" do |attacker|
+    attacker.vm.hostname = "attacker"
+    attacker.vm.network "private_network", ip: "192.168.56.20"
+
+    attacker.vm.provider "virtualbox" do |vb|
+      vb.name   = "firewall-attacker"
+      vb.memory = 512
+      vb.cpus   = 1
+      vb.customize ["modifyvm", :id, "--audio", "none"]
+      vb.customize ["modifyvm", :id, "--usb", "off"]
+    end
+
+    attacker.vm.provision "shell",
+      path: "env/setup.sh",
+      env: { "NODE_ROLE" => "attacker" }
+  end
+
+end
