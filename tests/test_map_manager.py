@@ -81,6 +81,8 @@ class MockEbpfMapManager(EbpfMapManager):
     def get_all_blocked_ips(self) -> list[str]:
         return list(self._store.keys())
 
+    def read_stats(self) -> dict[str, int]:
+        return {"dropped": 0, "passed": 0}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TEST 1: Logic IP conversion — quan trọng nhất

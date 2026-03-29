@@ -107,6 +107,8 @@ class TestBlockFlow:
         agent = NodeAgent(ebpf_map=ebpf_map)
         agent._redis = fake_redis  # inject Redis giả
 
+        agent._running = True # Bật agent
+
         # Chạy agent trong background
         agent_task = asyncio.create_task(agent._subscribe_and_process())
 
@@ -207,6 +209,8 @@ class TestUnblockFlow:
         agent = NodeAgent(ebpf_map=ebpf_map)
         agent._redis = fake_redis
 
+        agent._running = True # Bật agent
+        
         agent_task = asyncio.create_task(agent._subscribe_and_process())
         await asyncio.sleep(0.1)
 
@@ -246,6 +250,8 @@ class TestDuplicateIP:
 
         agent = NodeAgent(ebpf_map=ebpf_map)
         agent._redis = fake_redis
+
+        agent._running = True # Bật agent
 
         agent_task = asyncio.create_task(agent._subscribe_and_process())
         await asyncio.sleep(0.1)
@@ -305,6 +311,8 @@ class TestLatencySimulation:
 
         agent = NodeAgent(ebpf_map=ebpf_map)
         agent._redis = fake_redis
+
+        agent._running = True # Bật agent
 
         agent_task = asyncio.create_task(agent._subscribe_and_process())
         await asyncio.sleep(0.05)
