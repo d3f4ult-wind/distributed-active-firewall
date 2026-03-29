@@ -1,17 +1,8 @@
-/*
- * xdp_filter.c — Chương trình XDP chạy trong Linux Kernel space
- *
- * Chức năng: Kiểm tra IP nguồn của mỗi gói tin đến.
- * Nếu IP nằm trong eBPF LRU Hash Map (blacklist), lập tức DROP gói tin.
- * Nếu không có trong blacklist, trả về XDP_PASS để xử lý bình thường.
- *
- * Compile bằng: make (xem Makefile cùng thư mục)
- * Output: ../build/xdp_filter.o
- */
-/*---------------------------------------------------------------*/
 // SPDX-License-Identifier: GPL-2.0
 /*
  * xdp_filter.c — XDP/eBPF Packet Filter cho hệ thống Tường lửa Phân tán
+ *
+ * Phiên bản này bổ sung Stats Map (nice-to-have) so với bản đơn giản ban đầu.
  *
  * Vị trí trong kiến trúc (multistate firewall):
  *   [NIC Driver]
@@ -23,239 +14,267 @@
  *               └── iptables/netfilter ← TẦNG TRONG: stateful, kết nối thông thường
  *                       └── SYN Cookie (kernel tự xử lý SYN Flood)
  *
- * Luồng dữ liệu với userspace:
- *   node_agent.py (Python)
- *       └── map_manager.py
- *               └── bpf_map_update_elem() / bpf_map_delete_elem()
- *                       └── xdp_blacklist Map (file này)
- *                               └── XDP lookup → DROP/PASS
+ * Hai Maps trong file này:
+ *   1. xdp_blacklist — LRU Hash Map: Python ghi IP vào, XDP đọc để DROP
+ *   2. xdp_stats     — PerCPU Array: XDP ghi counter, Python đọc để monitor
  *
  * Cách compile:
- *   make    (xem Makefile trong cùng thư mục)
+ *   make
  *   # Hoặc thủ công:
  *   clang -O2 -g -target bpf -c xdp_filter.c -o build/xdp_filter.o
  *
  * Cách load và attach:
- *   # Attach vào interface eth1 (host-only NIC trong lab)
  *   sudo ip link set eth1 xdp obj build/xdp_filter.o sec xdp
- *   # Kiểm tra đã attach chưa
- *   ip link show eth1
- *   # Gỡ XDP
- *   sudo ip link set eth1 xdp off
+ *   ip link show eth1              # kiểm tra đã attach
+ *   sudo ip link set eth1 xdp off  # gỡ XDP
+ *
+ * Về libbpf:
+ *   File này chỉ cần package libbpf-dev (đã có trong env/setup.sh).
+ *   KHÔNG cần clone repo libbpf từ GitHub — đó là C loader userspace,
+ *   không phải thứ cần thiết ở kernel-side code này.
  *
  * ⚠️  LƯU Ý QUAN TRỌNG CHO NGƯỜI MỚI:
  *   1. Đây là "restricted C" — không phải C thông thường. Nhiều thứ bị cấm.
- *   2. Mọi truy cập packet data phải có bounds check — không thể bỏ qua.
- *   3. Không được dùng hàm kernel thông thường, chỉ dùng bpf_* helpers.
- *   4. Khi bị lỗi khi load, đọc output của: sudo ip link set eth1 xdp ...
- *      hoặc dùng: sudo bpftool prog load build/xdp_filter.o /sys/fs/bpf/prog
- *   5. Debug bằng bpf_trace_printk() → xem tại /sys/kernel/debug/tracing/trace_pipe
+ *   2. Mọi truy cập packet data phải có bounds check — verifier sẽ từ chối
+ *      load nếu thiếu, không phải runtime crash.
+ *   3. Không dùng hàm kernel thông thường, chỉ dùng bpf_* helpers.
+ *   4. Sau bpf_map_lookup_elem(), PHẢI check NULL kể cả khi biết chắc
+ *      không NULL — đây là yêu cầu của verifier, không phải logic thật.
+ *   5. Debug bằng bpf_trace_printk() → /sys/kernel/debug/tracing/trace_pipe
  */
 
-/* ── Includes ────────────────────────────────────────────────────────────────
- * Thứ tự include quan trọng: linux/* trước, bpf/* sau.
- * Không include <stdio.h>, <stdlib.h>, hay bất kỳ userspace header nào —
- * chúng không tồn tại trong kernel context.
+/* ── Includes ─────────────────────────────────────────────────────────────────
+ * Thứ tự: linux/* trước, bpf/* sau.
+ * Tuyệt đối KHÔNG include <stdio.h>, <stdlib.h> hay bất kỳ userspace header.
  */
-#include <linux/bpf.h>          /* XDP action codes: XDP_DROP, XDP_PASS, ...    */
+#include <linux/bpf.h>          /* XDP_DROP, XDP_PASS, XDP_ABORTED, ...         */
 #include <linux/if_ether.h>     /* struct ethhdr, ETH_P_IP (0x0800)             */
 #include <linux/ip.h>           /* struct iphdr, ip->saddr                      */
-#include <bpf/bpf_helpers.h>    /* SEC(), bpf_map_lookup_elem(), bpf_htons()    */
-#include <bpf/bpf_endian.h>     /* bpf_htons() — chuyển host↔network byte order */
+#include <bpf/bpf_helpers.h>    /* SEC(), __uint(), __type(),
+                                   bpf_map_lookup_elem(), bpf_map_update_elem() */
+#include <bpf/bpf_endian.h>     /* bpf_htons() — host ↔ network byte order      */
 
 
 /* ══════════════════════════════════════════════════════════════════════════════
- * PHẦN 1: Khai báo eBPF LRU Hash Map — "Blacklist" dùng chung với userspace
+ * PHẦN 1: Stats counter indices
  *
- * Đây là "cầu nối" duy nhất giữa XDP program (kernel) và Python (userspace).
- * node_agent.py ghi IP vào đây → XDP đọc và DROP packet từ IP đó.
+ * Dùng enum đặt tên cho từng slot trong Stats Array Map.
+ * Phải khớp chính xác với phía Python trong map_manager.py:
+ *   STATS_IDX_DROPPED = 0  →  Python: read_stats()[0]
+ *   STATS_IDX_PASSED  = 1  →  Python: read_stats()[1]
  *
- * Giải thích từng field:
- *   BPF_MAP_TYPE_LRU_HASH:
- *     LRU = Least Recently Used. Khi Map đầy (65536 entries), kernel tự động
- *     xóa entry ít được lookup nhất để nhường chỗ cho entry mới.
- *     Đây là giải pháp cho vấn đề "số lượng IP xấu tăng đột biến" như
- *     đề cập trong proposal — hệ thống không bao giờ bị OOM vì Map này.
+ * ⚠️  Nếu thêm counter mới ở đây, cập nhật map_manager.py tương ứng.
+ * ══════════════════════════════════════════════════════════════════════════════
+ */
+enum xdp_stats_idx {
+    STATS_IDX_DROPPED = 0,
+    STATS_IDX_PASSED  = 1,
+    STATS_IDX_MAX     = 2,   /* Kích thước mảng — phải là phần tử cuối */
+};
+
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ * PHẦN 2: Map 1 — xdp_blacklist
  *
- *   max_entries = 65536:
- *     64K entries × (4 bytes key + 1 byte value + overhead) ≈ vài MB RAM.
- *     Con số đủ lớn cho lab, điều chỉnh tùy scale thực tế.
+ * Đây là Map trung tâm của toàn hệ thống — "cầu nối" duy nhất giữa
+ * Python (userspace) và XDP (kernel). Python ghi IP vào, XDP đọc để DROP.
  *
- *   key = __u32 (IPv4 address):
- *     ⚠️  QUAN TRỌNG: Key phải là NETWORK BYTE ORDER (big-endian).
- *     ip->saddr trong kernel luôn là network byte order.
- *     map_manager.py dùng struct.unpack("!I", ...) để đảm bảo khớp.
- *     Nếu không khớp: lookup luôn miss trên máy x86 (little-endian).
+ * BPF_MAP_TYPE_LRU_HASH:
+ *   Khi Map đầy (65536 entries), kernel tự xóa entry ít lookup nhất.
+ *   Giải quyết "số IP xấu tăng đột biến" mà không cần quản lý thủ công.
+ *   Đây chính xác là lý do proposal chọn LRU thay vì HASH thông thường.
  *
- *   value = __u8:
- *     Không quan tâm đến value, chỉ cần biết key có TỒN TẠI không.
- *     Dùng 1 byte để tiết kiệm bộ nhớ tối đa.
+ * Key = __u32 (network byte order):
+ *   ⚠️  Phải khớp với cách Python ghi key:
+ *     struct.unpack("!I", socket.inet_aton(ip))[0]
+ *   "!" = network/big-endian. Sai byte order → lookup luôn miss trên x86.
  *
- *   pinning = LIBBPF_PIN_BY_NAME:
- *     Tự động pin Map tại /sys/fs/bpf/xdp_blacklist khi program load.
- *     "xdp_blacklist" = tên biến bên dưới.
- *     Nếu không pin: Map chỉ sống khi process đang load program còn sống.
- *     Với pin: Map tồn tại độc lập, node_agent.py có thể truy cập bất cứ lúc.
+ * pinning = LIBBPF_PIN_BY_NAME:
+ *   Pin Map tại /sys/fs/bpf/xdp_blacklist sau khi load.
+ *   Không pin → Map mất khi process loader thoát.
+ *   Có pin → node_agent.py truy cập được bất cứ lúc nào.
  * ══════════════════════════════════════════════════════════════════════════════
  */
 struct {
     __uint(type,        BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key,         __u32);   /* IPv4 source address — network byte order  */
-    __type(value,       __u8);    /* dummy: 1 = blocked, chỉ cần key tồn tại   */
-    __uint(pinning,     LIBBPF_PIN_BY_NAME); /* pin tại /sys/fs/bpf/xdp_blacklist */
+    __type(key,         __u32);  /* IPv4 source address — network byte order   */
+    __type(value,       __u8);   /* dummy: 1 = blocked. Chỉ cần key tồn tại.  */
+    __uint(pinning,     LIBBPF_PIN_BY_NAME);
 } xdp_blacklist SEC(".maps");
 
 
 /* ══════════════════════════════════════════════════════════════════════════════
- * PHẦN 2: Hàm XDP chính
+ * PHẦN 3: Map 2 — xdp_stats (nice-to-have: Statistics Counter)
  *
- * Kernel gọi hàm này với MỖI packet đến trên interface đã attach.
- * Hàm phải trả về một trong các XDP action codes:
- *   XDP_DROP    — Hủy packet ngay lập tức, không vào network stack.
- *                 Đây là action nhanh nhất và tốn ít CPU nhất.
- *   XDP_PASS    — Cho packet đi lên kernel network stack bình thường.
- *                 Iptables/netfilter sẽ xử lý tiếp (tầng thứ hai).
- *   XDP_TX      — Gửi packet ngược lại ra NIC (không dùng ở đây).
- *   XDP_REDIRECT — Chuyển packet sang interface/CPU khác (không dùng).
- *   XDP_ABORTED — Báo lỗi, drop packet và tăng error counter.
- *                 Dùng khi có lỗi không mong đợi (không bao giờ nên xảy ra).
+ * Lưu số liệu DROP/PASS để Python đọc và report.
+ * Biến kết quả benchmark từ "CPU giảm Z%" thành số liệu chính xác hơn:
+ * "XDP DROP X triệu packet/giây với Y% CPU".
  *
- * SEC("xdp"): Khai báo section name trong ELF object file.
- *   Tên này phải khớp với tham số "sec" trong lệnh ip link set:
+ * Tại sao dùng BPF_MAP_TYPE_PERCPU_ARRAY thay vì ARRAY thông thường?
+ *
+ *   Vấn đề với ARRAY thông thường trong môi trường đa nhân:
+ *     Nhiều CPU core cùng tăng counter → race condition → mất count.
+ *     Dùng atomic operations để fix thì tốn thêm CPU cycles.
+ *
+ *   PERCPU_ARRAY giải quyết thanh lịch hơn:
+ *     Kernel tạo một bản sao riêng cho MỖI CPU core.
+ *     Mỗi core chỉ đọc/ghi bản sao của mình → zero contention, zero lock.
+ *     Python đọc tổng bằng cách cộng tất cả bản sao lại.
+ *     Đây là pattern chuẩn cho high-performance counter trong eBPF.
+ *
+ *   max_entries = STATS_IDX_MAX = 2 (dropped + passed).
+ *   Pin tại /sys/fs/bpf/xdp_stats để map_manager.py đọc được.
+ * ══════════════════════════════════════════════════════════════════════════════
+ */
+struct {
+    __uint(type,        BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, STATS_IDX_MAX);
+    __type(key,         __u32);   /* STATS_IDX_DROPPED hoặc STATS_IDX_PASSED   */
+    __type(value,       __u64);   /* __u64 để không bị overflow khi flood       */
+    __uint(pinning,     LIBBPF_PIN_BY_NAME);
+} xdp_stats SEC(".maps");
+
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ * PHẦN 4: Helper — update_stats()
+ *
+ * Tách thành helper riêng để giữ hàm chính sạch và dễ đọc.
+ *
+ * __always_inline: yêu cầu compiler inline hàm này vào caller.
+ *   Trong eBPF, function call có overhead nhất định. Với helper nhỏ
+ *   được gọi trong hot path (mỗi packet), inline là lựa chọn đúng.
+ *
+ * ⚠️  NULL check sau bpf_map_lookup_elem() là BẮT BUỘC cho verifier:
+ *   Dù ARRAY map với index hợp lệ KHÔNG BAO GIỜ trả về NULL trong thực tế,
+ *   verifier không đủ thông minh để biết điều này. Nếu bỏ NULL check,
+ *   verifier in "invalid mem access 'map_value_or_null'" và từ chối load.
+ *   Đây là một trong những "gotcha" đặc trưng nhất của eBPF programming.
+ * ══════════════════════════════════════════════════════════════════════════════
+ */
+static __always_inline void update_stats(__u32 idx)
+{
+    __u64 *counter = bpf_map_lookup_elem(&xdp_stats, &idx);
+
+    if (!counter)   /* NULL check bắt buộc cho verifier — xem giải thích trên */
+        return;
+
+    (*counter)++;   /* Atomic-free vì PERCPU: mỗi CPU chỉ ghi bản sao của mình */
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ * PHẦN 5: Hàm XDP chính — xdp_filter_func
+ *
+ * Kernel gọi hàm này với MỖI packet đến. Phải xử lý trong vài nanoseconds.
+ *
+ * SEC("xdp"): section name trong ELF, phải khớp với lệnh attach:
  *   sudo ip link set eth1 xdp obj xdp_filter.o sec xdp
+ *
+ * Luồng xử lý:
+ *   Parse Ethernet → kiểm tra IPv4 → parse IP → lookup blacklist
+ *     → DROP + update dropped_counter  (nếu IP trong blacklist)
+ *     → PASS + update passed_counter   (nếu IP bình thường)
  * ══════════════════════════════════════════════════════════════════════════════
  */
 SEC("xdp")
 int xdp_filter_func(struct xdp_md *ctx)
 {
-    /*
-     * Bước 1: Lấy con trỏ đầu và cuối của packet trong bộ nhớ.
+    /* ── Bước 1: Con trỏ đầu/cuối packet ─────────────────────────────────────
      *
-     * ctx->data và ctx->data_end là __u32 offsets tương đối, không phải
-     * pointer thật. Phải cast sang (void *)(long) để dùng như pointer.
+     * ctx->data và ctx->data_end là __u32 offsets tương đối.
+     * Cast sang (void *)(long) là cách chuẩn trong eBPF C.
      *
-     * data     → byte đầu tiên của Ethernet frame
-     * data_end → byte SAU byte cuối cùng (exclusive end, giống STL iterator)
+     * data     = byte đầu tiên Ethernet frame
+     * data_end = byte ngay SAU byte cuối (exclusive, như STL iterator)
      *
-     * Mọi bounds check đều có dạng: if ((ptr + size) > data_end) return XDP_PASS
-     * Nghĩa là: "nếu accessing đến đây sẽ vượt quá boundary, bỏ qua packet này"
+     * Quy tắc bounds check: if ((ptr + 1) > data_end) → packet không đủ dài
      */
     void *data     = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
 
-    /*
-     * Bước 2: Parse Ethernet header.
+    /* ── Bước 2: Parse Ethernet header ────────────────────────────────────────
      *
-     * Ethernet frame layout:
-     *   [6 bytes dst MAC][6 bytes src MAC][2 bytes EtherType][payload...]
-     *   Total header = 14 bytes = sizeof(struct ethhdr)
+     * struct ethhdr = 14 bytes: [6B dst MAC][6B src MAC][2B EtherType]
+     * (eth + 1) = địa chỉ ngay sau struct ethhdr = byte đầu payload.
      *
-     * Bounds check bắt buộc:
-     *   (eth + 1) là địa chỉ NGAY SAU struct ethhdr — tức là byte đầu tiên
-     *   của payload. Nếu (eth + 1) > data_end, packet không đủ 14 bytes
-     *   để chứa Ethernet header — packet bị corrupt hoặc quá nhỏ → PASS.
-     *
-     * ⚠️  Nếu bỏ bounds check này, kernel verifier sẽ in:
-     *   "R1 offset is outside of the packet" và từ chối load.
+     * ⚠️  Bounds check bắt buộc. Thiếu → verifier từ chối load với:
+     *   "R1 offset is outside of the packet"
      */
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-        return XDP_PASS;  /* Packet quá nhỏ, không phải Ethernet hợp lệ */
+        return XDP_PASS;   /* Packet quá nhỏ, corrupt → bỏ qua */
 
-    /*
-     * Bước 3: Kiểm tra EtherType — chỉ xử lý IPv4.
+    /* ── Bước 3: Chỉ xử lý IPv4 ──────────────────────────────────────────────
      *
-     * eth->h_proto là big-endian (network byte order) vì nó nằm trong frame.
-     * ETH_P_IP (0x0800) được định nghĩa trong linux/if_ether.h là host order.
-     * Trên x86 (little-endian): 0x0800 host = 0x0008 network → không khớp!
+     * eth->h_proto là network byte order (big-endian, từ frame).
+     * ETH_P_IP = 0x0800 trong if_ether.h là host byte order.
      *
-     * ⚠️  PHẢI dùng bpf_htons() để chuyển ETH_P_IP sang network byte order
-     *   trước khi so sánh. Đây là lỗi byte order phổ biến nhất trong XDP code.
+     * ⚠️  PHẢI dùng bpf_htons(ETH_P_IP) để so sánh đúng.
+     *   Thiếu bpf_htons() trên x86: 0x0800 ≠ 0x0008 → mọi packet PASS.
+     *   Đây là lỗi byte order phổ biến nhất, không có warning nào cả.
      *
-     * Các EtherType khác (IPv6=0x86DD, ARP=0x0806...) ta để PASS qua — không
-     * phải nhiệm vụ của filter này.
+     * Non-IPv4 (ARP, IPv6, VLAN...) → PASS, để kernel xử lý bình thường.
      */
     if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return XDP_PASS;  /* Không phải IPv4: ARP, IPv6, VLAN... → bỏ qua */
+        return XDP_PASS;
 
-    /*
-     * Bước 4: Parse IP header.
+    /* ── Bước 4: Parse IP header ──────────────────────────────────────────────
      *
-     * IP header nằm ngay sau Ethernet header.
-     * (eth + 1) trỏ đến byte đầu tiên của IP header — cast sang struct iphdr*.
-     *
-     * Bounds check tương tự: kiểm tra struct iphdr (20 bytes minimum) nằm
-     * hoàn toàn trong packet.
-     *
-     * Lưu ý: IP header có thể có options (IHL > 5) làm header dài hơn 20 bytes.
-     * Với mục đích lọc theo source IP, ta chỉ cần fixed header (20 bytes đầu)
-     * vì saddr luôn nằm trong fixed header, không bị ảnh hưởng bởi options.
+     * IP header ngay sau Ethernet header.
+     * Minimum = 20 bytes = sizeof(struct iphdr).
+     * ip->saddr luôn nằm trong 20 bytes đầu (fixed header), nên chỉ cần
+     * kiểm tra minimum size dù IP có Options làm header dài hơn.
      */
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
-        return XDP_PASS;  /* IP header bị cắt ngắn → packet corrupt → PASS */
+        return XDP_PASS;   /* IP header bị cắt ngắn, corrupt → bỏ qua */
 
-    /*
-     * Bước 5: Lấy source IP và lookup trong blacklist Map.
+    /* ── Bước 5: Lookup source IP trong blacklist ─────────────────────────────
      *
-     * ip->saddr là source IP address — ĐÃ ở network byte order vì nó đến
-     * thẳng từ IP header trong packet. Không cần chuyển đổi thêm.
-     *
-     * map_manager.py (Python) lưu IP vào Map bằng cách dùng:
-     *   struct.unpack("!I", socket.inet_aton(ip_str))[0]
-     * Đây cũng là network byte order → hai bên khớp nhau → lookup chính xác.
+     * ip->saddr đã là network byte order (từ IP header trong packet).
+     * map_manager.py lưu key bằng struct.unpack("!I", ...) — cũng network order.
+     * Hai bên khớp nhau tự nhiên, không cần chuyển đổi thêm.
      *
      * bpf_map_lookup_elem():
-     *   Tham số 1: pointer đến Map (không phải Map fd!)
-     *   Tham số 2: pointer đến key (phải là __u32* cho Map này)
-     *   Trả về:    pointer đến value nếu key tồn tại, NULL nếu không có
-     *
-     * ⚠️  Không dùng giá trị trả về của bpf_map_lookup_elem() nếu nó không
-     *   NULL — trong trường hợp này ta chỉ cần biết NULL hay không.
-     *   Nếu muốn đọc value, PHẢI kiểm tra non-NULL trước khi deref.
+     *   Trả về pointer đến value nếu key tồn tại, NULL nếu không.
+     *   Ta chỉ cần biết NULL hay không — không cần đọc value (__u8 = 1).
      */
     __u32 src_ip = ip->saddr;
     __u8 *blocked = bpf_map_lookup_elem(&xdp_blacklist, &src_ip);
 
     if (blocked) {
-        /*
-         * IP nguồn có trong blacklist → DROP packet ngay lập tức.
+        /* ── IP trong blacklist → DROP ────────────────────────────────────────
          *
-         * Điều gì xảy ra khi XDP_DROP:
-         *   - Packet bị hủy ngay tại driver level
-         *   - Không có sk_buff allocation
-         *   - Không có netfilter traversal
-         *   - Không có routing lookup
-         *   - Kẻ tấn công nhận được... im lặng (timeout)
-         *   - CPU usage: gần như 0 so với iptables DROP
+         * Xảy ra tại driver level. Không có sk_buff allocation, không có
+         * netfilter traversal, không có routing lookup.
+         *
+         * Từ góc nhìn kẻ tấn công: packet biến mất im lặng → timeout.
+         * Không có RST hay ICMP unreachable — đây là dấu hiệu phân biệt
+         * "bị XDP DROP" với "bị iptables REJECT" trong attack_sim.sh.
          */
+        update_stats(STATS_IDX_DROPPED);
         return XDP_DROP;
     }
 
-    /*
-     * Bước 6: IP không có trong blacklist → cho packet đi qua.
+    /* ── IP không trong blacklist → PASS ─────────────────────────────────────
      *
-     * Packet sẽ tiếp tục đi lên kernel network stack:
-     *   XDP_PASS → sk_buff allocation → routing → netfilter/iptables → socket
-     *
-     * iptables/netfilter sẽ đảm nhiệm stateful filtering ở đây — đây là
-     * tầng thứ hai trong kiến trúc "multistate firewall" của đề tài.
-     * SYN Cookie cũng hoạt động ở tầng này để chống SYN Flood.
+     * Đi lên kernel network stack → iptables/netfilter xử lý tiếp.
+     * SYN Cookie hoạt động ở tầng này để chống SYN Flood.
+     * Đây là happy path — đại đa số packet đi qua đây.
      */
+    update_stats(STATS_IDX_PASSED);
     return XDP_PASS;
 }
 
 
 /* ══════════════════════════════════════════════════════════════════════════════
- * PHẦN 3: License declaration — BẮT BUỘC
+ * PHẦN 6: License — BẮT BUỘC
  *
- * Nhiều BPF helper functions (bao gồm bpf_map_lookup_elem) được đánh dấu
- * "GPL only" trong kernel. Nếu không khai báo GPL license, kernel sẽ
- * từ chối load chương trình với lỗi:
+ * Thiếu dòng này → kernel từ chối load với:
  *   "cannot call GPL-restricted function from non-GPL compatible program"
  *
- * SEC("license") là một ELF section đặc biệt mà libbpf đọc khi load.
+ * bpf_map_lookup_elem() và hầu hết BPF helpers đều là GPL-only trong kernel.
  * ══════════════════════════════════════════════════════════════════════════════
  */
 char LICENSE[] SEC("license") = "GPL";

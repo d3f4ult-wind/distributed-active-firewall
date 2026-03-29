@@ -1,8 +1,3 @@
-#!/bin/bash
-# Script cài đặt tự động cho từng node trong hệ thống.
-# Cài đặt: libbpf, clang, llvm (cho eBPF), redis-server, python3, pip.
-# Chạy script này trên mỗi VM sau khi clone repository về.
-# Sử dụng: ./setup.sh [edge|honeypot|broker]
 #!/usr/bin/env bash
 # =============================================================================
 # setup.sh — Cài đặt tự động môi trường cho từng VM
@@ -99,12 +94,23 @@ install_redis() {
     section "Cài đặt Redis server"
     apt-get install -y -qq redis-server
 
-    # Cấu hình Redis để lắng nghe trên tất cả interface
-    # (mặc định chỉ bind 127.0.0.1 — VM2 không kết nối được)
-    sed -i 's/^bind 127.0.0.1 -::1/bind 0.0.0.0/' /etc/redis/redis.conf
-
-    # Tắt protected mode vì đây là môi trường lab (không expose ra internet)
-    sed -i 's/^protected-mode yes/protected-mode no/' /etc/redis/redis.conf
+    # Thay thế toàn bộ redis.conf mặc định bằng file cấu hình của project.
+    # File env/redis.conf đã xử lý đầy đủ: bind 0.0.0.0, protected-mode no,
+    # RDB persistence (bảo vệ blacklist khi reboot), maxmemory, pubsub buffer.
+    # Cách này tốt hơn dùng sed vì kiểm soát được toàn bộ config, không phụ
+    # thuộc vào format của redis.conf mặc định (có thể thay đổi theo version).
+    if [[ -f "$PROJECT_DIR/env/redis.conf" ]]; then
+        cp "$PROJECT_DIR/env/redis.conf" /etc/redis/redis.conf
+        ok "Đã copy redis.conf từ project"
+    else
+        # Fallback: nếu chưa có file (chạy setup.sh trước khi có project),
+        # dùng sed như cũ — ít nhất đảm bảo bind và protected-mode đúng.
+        warn "Không tìm thấy $PROJECT_DIR/env/redis.conf — dùng sed fallback"
+        sed -i '"'"'s/^bind 127.0.0.1 -::1/bind 0.0.0.0/'"'"' /etc/redis/redis.conf
+        sed -i '"'"'s/^protected-mode yes/protected-mode no/'"'"' /etc/redis/redis.conf
+        warn "RDB persistence CHƯA được bật — blacklist sẽ mất sau khi reboot VM1!"
+        warn "Sau khi có project, chạy lại: sudo cp env/redis.conf /etc/redis/redis.conf && sudo systemctl restart redis-server"
+    fi
 
     systemctl restart redis-server
     systemctl enable redis-server

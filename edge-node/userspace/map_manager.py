@@ -1,7 +1,3 @@
-# map_manager.py — Quản lý eBPF LRU Hash Map từ userspace
-# Chức năng: Cung cấp các hàm thêm/xóa IP vào eBPF Map đang chạy trong kernel.
-# Đây là cầu nối giữa thế giới Python (userspace) và bộ nhớ eBPF (kernel space).
-# Sử dụng thư viện pyroute2 hoặc ctypes để ghi trực tiếp vào Map file descriptor.
 """
 map_manager.py — Đọc/ghi eBPF LRU Hash Map từ userspace Python.
 
@@ -78,6 +74,17 @@ BPF_EXIST   = 2  # Chỉ cập nhật, lỗi nếu chưa tồn tại
 # Path mặc định nơi xdp_filter.c pin Map — phải khớp với C code
 DEFAULT_MAP_PIN_PATH = "/sys/fs/bpf/xdp_blacklist"
 
+# Path cho Stats Map — khớp với tên biến xdp_stats trong xdp_filter.c
+DEFAULT_STATS_MAP_PIN_PATH = "/sys/fs/bpf/xdp_stats"
+
+# Indices của Stats Map — phải khớp chính xác với enum xdp_stats_idx trong C:
+#   enum xdp_stats_idx { STATS_IDX_DROPPED = 0, STATS_IDX_PASSED = 1, ... }
+# Nếu thêm counter mới trong C, phải cập nhật dict này tương ứng.
+STATS_INDICES = {
+    "dropped": 0,   # STATS_IDX_DROPPED
+    "passed":  1,   # STATS_IDX_PASSED
+}
+
 
 class BpfAttr(ctypes.Structure):
     """
@@ -152,6 +159,22 @@ class EbpfMapManager(ABC):
     @abstractmethod
     def get_all_blocked_ips(self) -> list[str]:
         """Lấy toàn bộ IP đang bị block."""
+        ...
+
+    @abstractmethod
+    def read_stats(self) -> dict[str, int]:
+        """
+        Đọc thống kê DROP/PASS từ xdp_stats Map.
+
+        Trả về dict dạng: {"dropped": X, "passed": Y}
+        Giá trị là tổng cộng dồn từ khi XDP program được load.
+
+        Lưu ý quan trọng về PERCPU_ARRAY:
+          xdp_stats là BPF_MAP_TYPE_PERCPU_ARRAY — mỗi CPU core có một bản
+          sao riêng của counter để tránh lock contention. Khi đọc từ userspace,
+          kernel trả về array N giá trị (N = số CPU core online).
+          Implementation phải cộng tất cả lại để ra tổng toàn hệ thống.
+        """
         ...
 
     # Context manager support — cho phép dùng `with LibbpfMapManager() as mgr:`
@@ -493,6 +516,62 @@ class LibbpfMapManager(EbpfMapManager):
         if self._fd is None:
             raise RuntimeError("Map chưa được open(). Gọi open() hoặc dùng context manager.")
 
+    def read_stats(self) -> dict[str, int]:
+        """
+        Đọc DROP/PASS counter từ xdp_stats PERCPU_ARRAY Map.
+
+        Cơ chế đọc PERCPU_ARRAY khác với LRU_HASH:
+          Khi gọi BPF_MAP_LOOKUP_ELEM trên PERCPU_ARRAY, kernel trả về
+          không phải một giá trị __u64 đơn lẻ, mà là một ARRAY gồm N
+          phần tử __u64, với N = số CPU logical cores trên máy.
+          Mỗi phần tử là counter của một CPU core riêng biệt.
+          Ta phải tạo buffer đủ lớn (N × 8 bytes) và cộng tất cả lại.
+
+        Cách lấy số CPU: os.cpu_count() hoặc đọc /sys/devices/system/cpu/online.
+        Dùng os.cpu_count() cho đơn giản — đủ chính xác cho lab.
+        """
+        import multiprocessing
+        num_cpus = multiprocessing.cpu_count()
+
+        # Mở fd riêng cho Stats Map (khác với blacklist fd)
+        if not self._libbpf:
+            raise RuntimeError("libbpf chưa được load. Gọi open() trước.")
+
+        stats_fd = self._libbpf.bpf_obj_get(DEFAULT_STATS_MAP_PIN_PATH.encode())
+        if stats_fd < 0:
+            logger.warning(
+                f"Không thể mở Stats Map tại '{DEFAULT_STATS_MAP_PIN_PATH}'. "
+                "Kiểm tra xdp_filter có đang chạy không."
+            )
+            return {"dropped": 0, "passed": 0}
+
+        result = {}
+        try:
+            for stat_name, idx in STATS_INDICES.items():
+                key = ctypes.c_uint32(idx)
+
+                # Buffer cho PERCPU value: num_cpus × sizeof(__u64)
+                # Phải align về 8 bytes — dùng c_uint64 array
+                percpu_buf = (ctypes.c_uint64 * num_cpus)()
+
+                attr = BpfAttr(
+                    map_fd=stats_fd,
+                    key=ctypes.addressof(key),
+                    value=ctypes.addressof(percpu_buf),
+                )
+                ret = self._bpf_syscall(BPF_MAP_LOOKUP_ELEM, attr)
+
+                if ret == 0:
+                    # Cộng tất cả per-CPU values lại để ra tổng
+                    total = sum(percpu_buf[i] for i in range(num_cpus))
+                    result[stat_name] = total
+                else:
+                    result[stat_name] = 0
+        finally:
+            os.close(stats_fd)
+
+        return result
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHẦN 4: BpftoolMapManager — dùng subprocess bpftool (cho admin/debug)
@@ -615,6 +694,44 @@ class BpftoolMapManager(EbpfMapManager):
         packed = socket.inet_aton(ip)
         return " ".join(f"{b:02x}" for b in packed)
 
+    def read_stats(self) -> dict[str, int]:
+        """
+        Đọc stats bằng bpftool map dump --json trên xdp_stats Map.
+
+        bpftool tự động xử lý PERCPU_ARRAY và trả về JSON với tất cả
+        per-CPU values. Mỗi entry có dạng:
+          {"key": ["0x00","0x00","0x00","0x00"], "values": [{"cpu":0,"value":123}, ...]}
+
+        Ta cộng tất cả "value" của từng CPU lại để ra tổng.
+        """
+        result_dict = {}
+        for stat_name, idx in STATS_INDICES.items():
+            cmd = [
+                self._bpftool_path, "map", "lookup",
+                "pinned", DEFAULT_STATS_MAP_PIN_PATH,
+                "key", "hex",
+                # idx là __u32 → 4 bytes little-endian (host order cho ARRAY key)
+                f"{idx & 0xff:02x}",
+                f"{(idx >> 8) & 0xff:02x}",
+                f"{(idx >> 16) & 0xff:02x}",
+                f"{(idx >> 24) & 0xff:02x}",
+                "--json",
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                result_dict[stat_name] = 0
+                continue
+            try:
+                data = json.loads(res.stdout)
+                # PERCPU_ARRAY: bpftool trả về list "values" với per-CPU entries
+                per_cpu_values = data.get("values", [])
+                total = sum(int(entry.get("value", 0)) for entry in per_cpu_values)
+                result_dict[stat_name] = total
+            except (json.JSONDecodeError, KeyError, TypeError):
+                result_dict[stat_name] = 0
+
+        return result_dict
+
     def _run(self, cmd: list, label: str) -> bool:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
@@ -672,6 +789,9 @@ class AsyncMapManager:
 
     async def get_all_blocked_ips(self) -> list[str]:
         return await self._run_sync(self._mgr.get_all_blocked_ips)
+
+    async def read_stats(self) -> dict[str, int]:
+        return await self._run_sync(self._mgr.read_stats)
 
     async def _run_sync(self, func, *args):
         """Chạy synchronous function trong thread pool."""
@@ -756,7 +876,7 @@ def _cli():
     """
     import sys
     if len(sys.argv) < 2:
-        print("Dùng: python map_manager.py [list|block|unblock|check] [ip]")
+        print("Dùng: python map_manager.py [list|block|unblock|check|stats] [ip]")
         sys.exit(1)
 
     cmd = sys.argv[1].lower()
@@ -784,6 +904,14 @@ def _cli():
             elif cmd == "check":
                 blocked = mgr.is_blocked(ip)
                 print(f"{ip}: {'BỊ CHẶN 🔒' if blocked else 'Được phép ✓'}")
+        elif cmd == "stats":
+            stats = mgr.read_stats()
+            print(f"  Dropped: {stats.get('dropped', 0):,} packets")
+            print(f"  Passed:  {stats.get('passed',  0):,} packets")
+            total = stats.get('dropped', 0) + stats.get('passed', 0)
+            if total > 0:
+                drop_pct = stats.get('dropped', 0) / total * 100
+                print(f"  Drop rate: {drop_pct:.1f}%")
         else:
             print(f"Lệnh không hợp lệ: {cmd}")
             sys.exit(1)
